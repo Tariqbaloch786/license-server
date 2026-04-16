@@ -82,6 +82,21 @@ async def activate(request: Request) -> JSONResponse:
     if not entry.get("active", True):
         return JSONResponse({"valid": False, "detail": "License key has been revoked."}, status_code=403)
 
+    # Check expiration
+    expires_at = entry.get("expires_at")
+    if expires_at:
+        try:
+            exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) > exp:
+                return JSONResponse(
+                    {"valid": False, "detail": f"License key expired on {exp.strftime('%Y-%m-%d')}."},
+                    status_code=403,
+                )
+        except Exception:
+            pass
+
     if not entry.get("device_id"):
         entry["device_id"] = device_id
         entry["activated_at"] = datetime.now(timezone.utc).isoformat()
@@ -114,12 +129,35 @@ async def admin_add(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     key = (body.get("key") or "").strip() or _gen_key()
+    expires_at = (body.get("expires_at") or "").strip() or None
     data = _load()
     if key in data:
         return JSONResponse({"error": "Key already exists"}, status_code=409)
-    data[key] = {"device_id": None, "activated_at": None, "machine_name": None, "active": True}
+    data[key] = {
+        "device_id": None,
+        "activated_at": None,
+        "machine_name": None,
+        "active": True,
+        "expires_at": expires_at,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
     _save(data)
     return JSONResponse({"ok": True, "key": key})
+
+
+@app.post("/admin/set_expiry")
+async def admin_set_expiry(request: Request) -> JSONResponse:
+    if not _check_admin(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    key = (body.get("key") or "").strip()
+    expires_at = (body.get("expires_at") or "").strip() or None
+    data = _load()
+    if key not in data:
+        return JSONResponse({"error": "Key not found"}, status_code=404)
+    data[key]["expires_at"] = expires_at
+    _save(data)
+    return JSONResponse({"ok": True})
 
 
 @app.post("/admin/revoke")
@@ -259,14 +297,33 @@ ADMIN_HTML = """<!DOCTYPE html>
   <div class="card">
     <div class="row">
       <div>
-        <label>Generate or add a key</label>
+        <label>License key</label>
         <input type="text" id="newKey" placeholder="Leave blank to auto-generate, or enter XXXX-XXXX-XXXX-XXXX">
       </div>
+      <div style="flex:0 0 180px">
+        <label>Expires on (optional)</label>
+        <input type="date" id="expDate">
+      </div>
+      <div style="flex:0 0 auto">
+        <label>&nbsp;</label>
+        <select id="expPreset" onchange="applyPreset()">
+          <option value="">Or pick preset...</option>
+          <option value="7">7 days</option>
+          <option value="30">30 days</option>
+          <option value="90">3 months</option>
+          <option value="180">6 months</option>
+          <option value="365">1 year</option>
+          <option value="lifetime">Lifetime (no expiry)</option>
+        </select>
+      </div>
       <div style="flex:0">
-        <button class="success" onclick="generateKey()">Generate Random</button>
-        <button onclick="addKey()">Add Key</button>
-        <button class="ghost" onclick="loadKeys()">Refresh</button>
-        <button class="ghost" onclick="logout()">Logout</button>
+        <label>&nbsp;</label>
+        <div>
+          <button class="success" onclick="generateKey()">Random Key</button>
+          <button onclick="addKey()">Add Key</button>
+          <button class="ghost" onclick="loadKeys()">Refresh</button>
+          <button class="ghost" onclick="logout()">Logout</button>
+        </div>
       </div>
     </div>
   </div>
@@ -277,6 +334,7 @@ ADMIN_HTML = """<!DOCTYPE html>
         <tr>
           <th>Key</th>
           <th>Status</th>
+          <th>Expires</th>
           <th>Activated</th>
           <th>Machine</th>
           <th>Actions</th>
@@ -347,16 +405,29 @@ function renderKeys(data) {
   tbody.innerHTML = '';
   const keys = Object.keys(data);
   let active=0, bound=0, revoked=0;
+  const now = new Date();
   keys.forEach(k => {
     const e = data[k];
+    const expired = e.expires_at && new Date(e.expires_at) < now;
     if (!e.active) revoked++;
     else { active++; if (e.device_id) bound++; }
     const tr = document.createElement('tr');
     let status;
     if (!e.active) status = '<span class="badge revoked">Revoked</span>';
+    else if (expired) status = '<span class="badge revoked">Expired</span>';
     else if (e.device_id) status = '<span class="badge bound">In Use</span>';
     else status = '<span class="badge unused">Unused</span>';
-    const activated = e.activated_at ? new Date(e.activated_at).toLocaleString() : '-';
+    let expires = '-';
+    if (e.expires_at) {
+      const d = new Date(e.expires_at);
+      const daysLeft = Math.ceil((d - now) / 86400000);
+      if (daysLeft < 0) expires = `<span style="color:#dc2626">${d.toLocaleDateString()} (expired)</span>`;
+      else if (daysLeft <= 7) expires = `<span style="color:#f59e0b">${d.toLocaleDateString()} (${daysLeft}d left)</span>`;
+      else expires = `${d.toLocaleDateString()} (${daysLeft}d left)`;
+    } else {
+      expires = '<span style="color:#16a34a">Lifetime</span>';
+    }
+    const activated = e.activated_at ? new Date(e.activated_at).toLocaleDateString() : '-';
     const machine = e.machine_name || '-';
     let actions = '';
     if (e.active) {
@@ -367,9 +438,10 @@ function renderKeys(data) {
     if (e.device_id) {
       actions += `<button class="ghost" onclick="resetKey('${k}')">Reset Device</button>`;
     }
+    actions += `<button class="ghost" onclick="editExpiry('${k}', '${e.expires_at || ''}')">Edit Expiry</button>`;
     actions += `<button class="ghost" onclick="copyKey('${k}')">Copy</button>`;
     actions += `<button class="danger" onclick="deleteKey('${k}')">Delete</button>`;
-    tr.innerHTML = `<td class="key">${k}</td><td>${status}</td><td>${activated}</td><td>${machine}</td><td>${actions}</td>`;
+    tr.innerHTML = `<td class="key">${k}</td><td>${status}</td><td>${expires}</td><td>${activated}</td><td>${machine}</td><td>${actions}</td>`;
     tbody.appendChild(tr);
   });
   document.getElementById('s-total').textContent = keys.length;
@@ -377,6 +449,26 @@ function renderKeys(data) {
   document.getElementById('s-bound').textContent = bound;
   document.getElementById('s-revoked').textContent = revoked;
   document.getElementById('empty').style.display = keys.length ? 'none' : 'block';
+}
+
+function applyPreset() {
+  const val = document.getElementById('expPreset').value;
+  const exp = document.getElementById('expDate');
+  if (!val) return;
+  if (val === 'lifetime') { exp.value = ''; return; }
+  const d = new Date();
+  d.setDate(d.getDate() + parseInt(val, 10));
+  exp.value = d.toISOString().split('T')[0];
+}
+
+async function editExpiry(key, current) {
+  const input = prompt(`Set expiration for ${key}\n\nEnter date as YYYY-MM-DD (e.g. 2026-12-31), or leave blank for lifetime:`, current ? current.split('T')[0] : '');
+  if (input === null) return;
+  const expires_at = input.trim() ? input.trim() + 'T23:59:59Z' : null;
+  const res = await api('/admin/set_expiry', 'POST', { key, expires_at });
+  if (res.error) { toast(res.error, true); return; }
+  toast('Expiry updated');
+  loadKeys();
 }
 
 function genKey() {
@@ -391,10 +483,14 @@ function generateKey() {
 
 async function addKey() {
   const key = document.getElementById('newKey').value.trim();
-  const res = await api('/admin/add', 'POST', { key });
+  const expDateVal = document.getElementById('expDate').value;
+  const expires_at = expDateVal ? expDateVal + 'T23:59:59Z' : null;
+  const res = await api('/admin/add', 'POST', { key, expires_at });
   if (res.error) { toast(res.error, true); return; }
   toast(`Added: ${res.key}`);
   document.getElementById('newKey').value = '';
+  document.getElementById('expDate').value = '';
+  document.getElementById('expPreset').value = '';
   loadKeys();
 }
 
